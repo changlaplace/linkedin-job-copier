@@ -56,6 +56,12 @@
     return null;
   }
 
+  function getCurrentJobId() {
+    return new URL(window.location.href).searchParams.get('currentJobId')
+      || window.location.pathname.match(/\/jobs\/view\/(\d+)/)?.[1]
+      || null;
+  }
+
   // ─── Find anchor to inject button next to ─────────────────────────────────
   // On /jobs/collections/ pages: uses class-based selectors (Apply button area)
   // On /jobs/view/ pages: LinkedIn uses hashed classes, so we find Save button by text
@@ -76,21 +82,43 @@
   }
 
   function findJobTitleEl() {
+    const jobId = getCurrentJobId();
+    if (jobId && /^\d+$/.test(jobId)) {
+      const currentJobLink = document.querySelector(`a[href*="/jobs/view/${jobId}/"]`);
+      if (currentJobLink) return currentJobLink;
+    }
     return queryFirst(JOB_TITLE_SELECTORS) || document.querySelector('h1');
   }
 
   function findCompanyEl() {
     const bySelector = queryFirst(COMPANY_SELECTORS);
     if (bySelector) return bySelector;
-    const h1 = document.querySelector('h1');
-    if (h1) {
-      const parent = h1.closest('div, section');
-      if (parent) {
-        const anchor = parent.querySelector('a[href*="/company/"]');
-        if (anchor) return anchor;
-      }
+    let parent = findJobTitleEl()?.parentElement;
+    for (let i = 0; parent && i < 8; i++, parent = parent.parentElement) {
+      const anchor = parent.querySelector('a[href*="/company/"]');
+      if (anchor?.innerText?.trim()) return anchor;
     }
     return null;
+  }
+
+  async function cacheCurrentJob() {
+    const jobId = getCurrentJobId();
+    const description = extractDescription() || '';
+    const job = {
+      jobId,
+      title: findJobTitleEl()?.innerText?.trim() || 'N/A',
+      company: findCompanyEl()?.innerText?.trim() || 'N/A',
+      location: queryFirst(LOCATION_SELECTORS)?.innerText?.trim() || '',
+      url: jobId ? `https://www.linkedin.com/jobs/view/${jobId}/` : window.location.href,
+      description,
+      fullText: buildClipboardText(),
+      copiedAt: Date.now()
+    };
+    const { savedJobs = [] } = await chrome.storage.local.get({ savedJobs: [] });
+    const key = job.jobId || job.url;
+    await chrome.storage.local.set({
+      savedJobs: [job, ...savedJobs.filter(saved => (saved.jobId || saved.url) !== key)]
+    });
   }
 
   function findDescriptionEl() {
@@ -167,6 +195,7 @@
     btn.textContent = 'Copying…';
     const success = await copyToClipboard(buildClipboardText());
     if (success) {
+      try { await cacheCurrentJob(); } catch (_) {}
       btn.textContent = '✓ Copied!';
       btn.classList.add('ljc-btn--success');
       showToast('Job description copied to clipboard!');
@@ -230,11 +259,13 @@
   // ─── Message listener ──────────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.action === 'scrapeCurrentJob') {
+      const jobId = getCurrentJobId();
       sendResponse({
+        jobId,
         title:       findJobTitleEl()?.innerText?.trim()                || 'N/A',
         company:     findCompanyEl()?.innerText?.trim()                 || 'N/A',
         location:    queryFirst(LOCATION_SELECTORS)?.innerText?.trim() || 'N/A',
-        url:         window.location.href,
+        url:         jobId ? `https://www.linkedin.com/jobs/view/${jobId}/` : window.location.href,
         description: extractDescription() || '',
         fullText:    buildClipboardText()
       });

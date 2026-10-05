@@ -33,7 +33,7 @@
     <!-- Main content (shown when on LinkedIn) -->
     <div id="mainContent" hidden>
       <!-- Current Job Section -->
-      <section class="section">
+      <section id="currentJobSection" class="section">
         <div class="section__head">
           <span class="section__label">Current Job</span>
         </div>
@@ -50,17 +50,17 @@
         </div>
       </section>
 
-      <div class="divider"></div>
+      <div id="currentJobDivider" class="divider"></div>
 
       <!-- Job List Section -->
       <section class="section">
         <div class="section__head">
-          <span class="section__label">Jobs on This Page</span>
-          <button id="scrapeListBtn" class="btn btn--sm btn--outline">Scrape List</button>
+          <span id="savedJobsLabel" class="section__label">Saved Jobs</span>
+          <button id="clearSavedBtn" class="btn btn--sm btn--outline">Clear</button>
         </div>
 
         <div id="jobListState" class="list-empty">
-          <p>Click "Scrape List" to extract all job cards visible on this page.</p>
+          <p>Copied jobs will appear here automatically.</p>
         </div>
 
         <div id="jobList" class="job-list" hidden></div>
