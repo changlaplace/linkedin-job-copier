@@ -5,7 +5,15 @@
   window.__ljcInjected = true;
 
   const BUTTON_ID = 'ljc-copy-btn';
+  const BATCH_CONTROL_ID = 'ljc-batch-controls';
+  const BATCH_BUTTON_ID = 'ljc-save-page-btn';
+  const PAGE_COUNT_ID = 'ljc-page-count';
   const TOAST_ID  = 'ljc-toast';
+  const JOB_CARD_SELECTOR = '[role="button"][componentkey^="job-card-component-ref-"]';
+  let batchRunning = false;
+  let batchCancelled = false;
+  let batchProgress = '';
+  let batchPageLimit = '1';
 
   const JOB_TITLE_SELECTORS = [
     '.job-details-jobs-unified-top-card__job-title h1',
@@ -101,9 +109,15 @@
     return null;
   }
 
-  async function cacheCurrentJob() {
+  async function cacheCurrentJob(expectedJobId = null) {
     const jobId = getCurrentJobId();
     const description = extractDescription() || '';
+    if (expectedJobId && jobId !== expectedJobId) {
+      throw new Error(`Expected job ${expectedJobId}, got ${jobId || 'none'}`);
+    }
+    if (!jobId || description.trim().length < 80) {
+      throw new Error('Full job description is not ready');
+    }
     const job = {
       jobId,
       title: findJobTitleEl()?.innerText?.trim() || 'N/A',
@@ -119,9 +133,15 @@
     await chrome.storage.local.set({
       savedJobs: [job, ...savedJobs.filter(saved => (saved.jobId || saved.url) !== key)]
     });
+    return job;
   }
 
   function findDescriptionEl() {
+    const jobId = getCurrentJobId();
+    if (jobId && /^\d+$/.test(jobId)) {
+      const currentDescription = findDescriptionElForJob(jobId);
+      if (currentDescription) return currentDescription;
+    }
     const bySelector = queryFirst(DESCRIPTION_SELECTORS);
     if (bySelector) return bySelector;
     let best = null, bestLen = 0;
@@ -136,6 +156,12 @@
       }
     }
     return best;
+  }
+
+  function findDescriptionElForJob(jobId) {
+    return document.querySelector(
+      `[componentkey="JobDetails_AboutTheJob_${jobId}"], #JobDetails_AboutTheJob_${jobId}`
+    );
   }
 
   function extractDescription() {
@@ -231,6 +257,241 @@
     anchor.el.insertAdjacentElement('afterend', btn);
   }
 
+  function getJobIdFromCard(card) {
+    return card?.getAttribute('componentkey')?.match(/job-card-component-ref-(\d+)$/)?.[1]
+      || card?.dataset?.occludableJobId
+      || card?.dataset?.jobId
+      || null;
+  }
+
+  function getJobCards() {
+    const cards = document.querySelectorAll(
+      `${JOB_CARD_SELECTOR}, [data-occludable-job-id], [data-job-id]`
+    );
+    const seen = new Set();
+    return [...cards].filter(card => {
+      const jobId = getJobIdFromCard(card);
+      if (!jobId || seen.has(jobId)) return false;
+      seen.add(jobId);
+      return true;
+    });
+  }
+
+  function findJobCard(jobId) {
+    return getJobCards().find(card => getJobIdFromCard(card) === jobId) || null;
+  }
+
+  function markJobCard(jobId, saved = true) {
+    const card = findJobCard(jobId);
+    if (!card) return;
+    card.classList.toggle('ljc-job-card--saved', saved);
+    let mark = card.querySelector(':scope > .ljc-job-saved-mark');
+    if (saved && !mark) {
+      mark = document.createElement('span');
+      mark.className = 'ljc-job-saved-mark';
+      mark.textContent = '\u2713';
+      mark.title = 'Full job description saved';
+      mark.setAttribute('aria-label', 'Full job description saved');
+      card.prepend(mark);
+    } else if (!saved && mark) {
+      mark.remove();
+    }
+  }
+
+  async function refreshSavedMarkers() {
+    const { savedJobs = [] } = await chrome.storage.local.get({ savedJobs: [] });
+    const savedIds = new Set(savedJobs
+      .filter(job => job.jobId && (job.description || '').trim().length >= 80)
+      .map(job => String(job.jobId)));
+    getJobCards().forEach(card => {
+      const jobId = getJobIdFromCard(card);
+      markJobCard(jobId, savedIds.has(jobId));
+    });
+  }
+
+  function waitForJobDescription(jobId, timeoutMs = 12000) {
+    return new Promise(resolve => {
+      const startedAt = Date.now();
+      const check = () => {
+        const usesNewJobCards = Boolean(document.querySelector(JOB_CARD_SELECTOR));
+        const expectedDescription = findDescriptionElForJob(jobId);
+        const description = getCurrentJobId() === jobId
+          ? (usesNewJobCards ? expectedDescription?.innerText : extractDescription())
+          : '';
+        if (description && description.trim().length >= 80) return resolve(true);
+        if (Date.now() - startedAt >= timeoutMs) return resolve(false);
+        setTimeout(check, 200);
+      };
+      check();
+    });
+  }
+
+  function updateBatchControls() {
+    const button = document.getElementById(BATCH_BUTTON_ID);
+    const input = document.getElementById(PAGE_COUNT_ID);
+    if (button) button.textContent = batchRunning ? `Stop \u2014 ${batchProgress}` : 'Save jobs';
+    if (input) input.disabled = batchRunning;
+  }
+
+  function getPageSignature() {
+    return getJobCards().map(getJobIdFromCard).join(',');
+  }
+
+  function findNextPageButton() {
+    const list = document.querySelector('[componentkey="SearchResultsMainContent"]');
+    return [...(list?.querySelectorAll('button') || [])].find(button =>
+      button.innerText?.trim().toLowerCase() === 'next'
+      && !button.disabled
+      && button.getAttribute('aria-disabled') !== 'true'
+    ) || null;
+  }
+
+  function waitForNextPage(previousSignature, previousStart, timeoutMs = 15000) {
+    return new Promise(resolve => {
+      const startedAt = Date.now();
+      let candidateSignature = '';
+      let stableSince = 0;
+      const check = () => {
+        if (batchCancelled) return resolve(false);
+        const signature = getPageSignature();
+        const start = new URL(window.location.href).searchParams.get('start') || '0';
+        if (signature && signature !== previousSignature && start !== previousStart) {
+          if (signature !== candidateSignature) {
+            candidateSignature = signature;
+            stableSince = Date.now();
+          } else if (Date.now() - stableSince >= 800) {
+            return resolve(true);
+          }
+        }
+        if (Date.now() - startedAt >= timeoutMs) return resolve(false);
+        setTimeout(check, 250);
+      };
+      check();
+    });
+  }
+
+  async function goToNextPage() {
+    const next = findNextPageButton();
+    if (!next) return false;
+    const previousSignature = getPageSignature();
+    const previousStart = new URL(window.location.href).searchParams.get('start') || '0';
+    next.click();
+    return waitForNextPage(previousSignature, previousStart);
+  }
+
+  async function saveJobsOnPage(btn) {
+    if (batchRunning) {
+      batchCancelled = true;
+      batchProgress = 'Stopping after this job\u2026';
+      updateBatchControls();
+      return;
+    }
+
+    const input = document.getElementById(PAGE_COUNT_ID);
+    const parsedPages = Number.parseInt(input?.value || '1', 10);
+    const requestedPages = Number.isFinite(parsedPages) && parsedPages >= 0 ? parsedPages : 1;
+    batchPageLimit = String(requestedPages);
+    const unlimited = requestedPages === 0;
+    if (!getJobCards().length) {
+      showToast('No jobs found on this page', 'error');
+      return;
+    }
+
+    batchRunning = true;
+    batchCancelled = false;
+    let saved = 0;
+    let failed = 0;
+    let pagesProcessed = 0;
+    const seenPages = new Set();
+
+    while (!batchCancelled && (unlimited || pagesProcessed < requestedPages)) {
+      const pageSignature = getPageSignature();
+      if (!pageSignature || seenPages.has(pageSignature)) break;
+      seenPages.add(pageSignature);
+      pagesProcessed++;
+
+      const jobIds = getJobCards().map(getJobIdFromCard);
+      for (let i = 0; i < jobIds.length && !batchCancelled; i++) {
+        const jobId = jobIds[i];
+        batchProgress = `Page ${pagesProcessed}, job ${i + 1}/${jobIds.length}`;
+        updateBatchControls();
+        const card = findJobCard(jobId);
+        if (!card) {
+          failed++;
+          continue;
+        }
+
+        try {
+          card.click();
+          const ready = await waitForJobDescription(jobId);
+          if (!ready) throw new Error('Description did not load');
+          await cacheCurrentJob(jobId);
+          markJobCard(jobId, true);
+          saved++;
+        } catch (_) {
+          failed++;
+        }
+      }
+
+      if (batchCancelled || (!unlimited && pagesProcessed >= requestedPages)) break;
+      batchProgress = `Opening page ${pagesProcessed + 1}\u2026`;
+      updateBatchControls();
+      if (!await goToNextPage()) break;
+      await refreshSavedMarkers();
+    }
+
+    const wasCancelled = batchCancelled;
+    batchRunning = false;
+    batchCancelled = false;
+    batchProgress = '';
+    updateBatchControls();
+    await refreshSavedMarkers();
+    showToast(
+      wasCancelled
+        ? `Stopped: ${saved} jobs saved across ${pagesProcessed} page(s)`
+        : `${saved} jobs saved across ${pagesProcessed} page(s)${failed ? `, ${failed} failed` : ''}`,
+      failed ? 'error' : 'success'
+    );
+  }
+
+  function injectBatchButton() {
+    if (document.getElementById(BATCH_CONTROL_ID)) return;
+    const list = document.querySelector('[componentkey="SearchResultsMainContent"]');
+    if (!list || !getJobCards().length) return;
+
+    const controls = document.createElement('div');
+    controls.id = BATCH_CONTROL_ID;
+    controls.className = 'ljc-batch-controls';
+
+    const label = document.createElement('label');
+    label.htmlFor = PAGE_COUNT_ID;
+    label.textContent = 'Pages (0 = all)';
+
+    const input = document.createElement('input');
+    input.id = PAGE_COUNT_ID;
+    input.type = 'number';
+    input.min = '0';
+    input.step = '1';
+    input.value = batchPageLimit;
+    input.title = 'Number of pages to save; use 0 to continue until the last page';
+
+    const btn = document.createElement('button');
+    btn.id = BATCH_BUTTON_ID;
+    btn.className = 'ljc-batch-btn';
+    btn.title = 'Open each job, cache its full description, then continue to the next page';
+    btn.addEventListener('click', () => saveJobsOnPage(btn));
+
+    controls.append(label, input, btn);
+    list.prepend(controls);
+    updateBatchControls();
+  }
+
+  function refreshPageControls() {
+    injectButton();
+    injectBatchButton();
+    refreshSavedMarkers().catch(() => {});
+  }
+
   // ─── SPA navigation ────────────────────────────────────────────────────────
   let lastUrl = location.href;
   function onUrlChange() {
@@ -239,7 +500,7 @@
       lastUrl = current;
       const old = document.getElementById(BUTTON_ID);
       if (old) old.remove();
-      [800, 1500, 2500, 4000].forEach(d => setTimeout(injectButton, d));
+      [800, 1500, 2500, 4000].forEach(d => setTimeout(refreshPageControls, d));
     }
   }
   const _push = history.pushState.bind(history);
@@ -251,10 +512,14 @@
   let debounceTimer = null;
   const observer = new MutationObserver(() => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(injectButton, 600);
+    debounceTimer = setTimeout(refreshPageControls, 600);
   });
   observer.observe(document.body, { childList: true, subtree: true });
-  [1000, 2000, 3500].forEach(d => setTimeout(injectButton, d));
+  [1000, 2000, 3500].forEach(d => setTimeout(refreshPageControls, d));
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' && changes.savedJobs) refreshSavedMarkers().catch(() => {});
+  });
 
   // ─── Message listener ──────────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -278,12 +543,12 @@
 
   // ─── Scrape job list ───────────────────────────────────────────────────────
   function scrapeJobList() {
-    const cards = document.querySelectorAll('[data-occludable-job-id], [data-job-id]');
+    const cards = getJobCards();
     const seen = new Set();
     const results = [];
 
     cards.forEach(card => {
-      const jobId = card.dataset.occludableJobId || card.dataset.jobId;
+      const jobId = getJobIdFromCard(card);
       if (!jobId || seen.has(jobId)) return;
       seen.add(jobId);
 
